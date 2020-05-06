@@ -12,7 +12,9 @@
 #include <string>
 
 #include <sys/socket.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 using namespace std;
@@ -29,12 +31,17 @@ using namespace std;
 
 typedef struct
 {
-	char *servip;
-	struct sockaddr_in *servaddr;
+	char *pdst;
 	char *port;
+	struct sockaddr *dst, *data;
+	socklen_t dstlen, datalen;
+	struct sockaddr_in *servaddr;
 } ConnInfo;
 
 ConnInfo *info;
+
+// Get IP/Domain information.
+int tcp_getaddrinfo(char *, char *, bool);
 
 // Judge port is legal or not.
 inline bool isLegalPort(int);
@@ -69,6 +76,7 @@ int main(int argc, char **argv)
 	try
 	{
 		argument_process(argc, argv);
+		tcp_getaddrinfo(info->pdst, info->port, false);
 		sockfd = create_initial_socket();
 		user_login(sockfd);
 		command_input(sockfd);
@@ -82,6 +90,33 @@ int main(int argc, char **argv)
 	if (sockfd != -1)
 		close(sockfd);
 	delete info;
+	return 0;
+}
+
+int tcp_getaddrinfo(char *pdst, char *port, bool data)
+{
+	struct addrinfo dst_hints;
+	struct addrinfo *dst;
+
+	memset(&dst_hints, 0, sizeof(dst_hints));
+	dst_hints.ai_flags = AI_CANONNAME;
+	dst_hints.ai_family = AF_INET;
+	dst_hints.ai_socktype = SOCK_STREAM;
+	dst_hints.ai_protocol = IPPROTO_TCP;
+
+	if (getaddrinfo(pdst, port, &dst_hints, &dst))
+		throw "Invalid target host";
+
+	if (!data)
+	{
+		info->dst = dst->ai_addr;
+		info->dstlen = dst->ai_addrlen;
+	}
+	else
+	{
+		info->data = dst->ai_addr;
+		info->dstlen = dst->ai_addrlen;
+	}
 	return 0;
 }
 
@@ -136,7 +171,7 @@ void argument_process(int argc, char **argv)
 	if (argc != 3)
 		throw "Invalid argument count\nUsage: ./client [server IP] [port]";
 
-	char *servip = argv[1];
+	char *pdst = argv[1];
 	int servport_int = atoi(argv[2]);
 	char *servport = argv[2];
 
@@ -151,10 +186,10 @@ void argument_process(int argc, char **argv)
 	if (info->servaddr == NULL)
 		throw "Can't allocate servaddr";
 
-	info->servip = servip;
+	info->pdst = pdst;
 	info->port = servport;
 	info->servaddr->sin_family = AF_INET;
-	info->servaddr->sin_addr.s_addr = inet_addr(servip);
+	info->servaddr->sin_addr.s_addr = inet_addr(pdst);
 	info->servaddr->sin_port = htons(atoi(servport));
 
 	return;
@@ -162,19 +197,17 @@ void argument_process(int argc, char **argv)
 
 int create_initial_socket()
 {
-	int sockfd;
+	int sockfd, on = 1;
 
 	// create a socket for the client
 	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
 		throw "Can't create initial client socket";
 
+	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
+		throw "Can't set sockopt";
+
 	// connect initial socket to server
-	struct sockaddr_in servaddr;
-	memset(&servaddr, 0, sizeof(servaddr));
-	servaddr.sin_family = info->servaddr->sin_family;
-	servaddr.sin_addr.s_addr = info->servaddr->sin_addr.s_addr;
-	servaddr.sin_port = info->servaddr->sin_port;
-	if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+	if (connect(sockfd, info->dst, info->dstlen) < 0)
 		throw "Can't connect initial socket to server";
 
 	return sockfd;
@@ -424,14 +457,17 @@ int command_input(int sockfd)
 
 int create_socket(int port, char *addr)
 {
-	int sockfd;
-	struct sockaddr_in servaddr;
+	int sockfd, on = 1;
 
 	// create a socket for the client
 	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
 		throw "Can't create socket";
 
+	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
+		throw "Can't set sockopt";
+
 	// creation of the socket
+	struct sockaddr_in servaddr;
 	memset(&servaddr, 0, sizeof(servaddr));
 	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = inet_addr(addr);
@@ -439,6 +475,8 @@ int create_socket(int port, char *addr)
 
 	if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
 		throw "Can't create data channel";
+	// if (connect(sockfd, info->data, info->datalen) < 0)
+	// 	throw "Can't create data channel";
 
 	return sockfd;
 }
@@ -516,7 +554,10 @@ int get_pasv_socket(int sockfd)
 	if (!isLegalPort(data_port))
 		throw "Invalid data transfer port";
 
-	int data_sock = create_socket(data_port, info->servip);
+	char data_port_str[10];
+	sprintf(data_port_str, "%d", data_port);
+	tcp_getaddrinfo(info->pdst, data_port_str, true);
+	int data_sock = create_socket(data_port, info->pdst);
 
 	return data_sock;
 }
