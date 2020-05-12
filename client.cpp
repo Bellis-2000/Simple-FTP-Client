@@ -31,20 +31,21 @@ using namespace std;
 
 typedef struct
 {
-	char *pdst;
+	char *dsturl;
+	char *dstip;
 	char *port;
-	struct sockaddr *dst, *data;
-	socklen_t dstlen, datalen;
-	struct sockaddr_in *servaddr;
+	struct sockaddr *dst;
+	socklen_t dstlen, addrlen;
+	struct sockaddr_in *dstaddr;
 } ConnInfo;
 
 ConnInfo *info;
 
 // Get IP/Domain information.
-int tcp_getaddrinfo(char *, char *, bool);
+int tcp_getaddrinfo(char *, char *);
 
 // Judge port is legal or not.
-inline bool isLegalPort(int);
+inline bool isLegalPort(char *);
 
 // The dialog shows when local/server already has file with the same name.
 bool confirmOverwrite();
@@ -76,7 +77,7 @@ int main(int argc, char **argv)
 	try
 	{
 		argument_process(argc, argv);
-		tcp_getaddrinfo(info->pdst, info->port, false);
+		tcp_getaddrinfo(info->dsturl, info->port);
 		sockfd = create_initial_socket();
 		user_login(sockfd);
 		command_input(sockfd);
@@ -93,7 +94,7 @@ int main(int argc, char **argv)
 	return 0;
 }
 
-int tcp_getaddrinfo(char *pdst, char *port, bool data)
+int tcp_getaddrinfo(char *dsturl, char *port)
 {
 	struct addrinfo dst_hints;
 	struct addrinfo *dst;
@@ -104,25 +105,19 @@ int tcp_getaddrinfo(char *pdst, char *port, bool data)
 	dst_hints.ai_socktype = SOCK_STREAM;
 	dst_hints.ai_protocol = IPPROTO_TCP;
 
-	if (getaddrinfo(pdst, port, &dst_hints, &dst))
+	if (getaddrinfo(dsturl, port, &dst_hints, &dst))
 		throw "Invalid target host";
 
-	if (!data)
-	{
-		info->dst = dst->ai_addr;
-		info->dstlen = dst->ai_addrlen;
-	}
-	else
-	{
-		info->data = dst->ai_addr;
-		info->dstlen = dst->ai_addrlen;
-	}
+	info->dst = dst->ai_addr;
+	info->dstlen = dst->ai_addrlen;
+
 	return 0;
 }
 
-inline bool isLegalPort(int port)
+inline bool isLegalPort(char *port)
 {
-	return port >= 1 && port <= 65535;
+	int port_int = atoi(port);
+	return port_int >= 1 && port_int <= 65535;
 }
 
 bool confirmOverwrite()
@@ -171,26 +166,18 @@ void argument_process(int argc, char **argv)
 	if (argc != 3)
 		throw "Invalid argument count\nUsage: ./client [server IP] [port]";
 
-	char *pdst = argv[1];
-	int servport_int = atoi(argv[2]);
-	char *servport = argv[2];
+	char *dsturl = argv[1];
+	char *dstport = argv[2];
 
-	if (!isLegalPort(servport_int))
+	if (!isLegalPort(dstport))
 		throw "Invalid destination port";
 
 	info = (ConnInfo *)calloc(1, sizeof(ConnInfo));
 	if (info == NULL)
 		throw "Can't allocate info";
 
-	info->servaddr = (struct sockaddr_in *)calloc(1, sizeof(struct sockaddr_in));
-	if (info->servaddr == NULL)
-		throw "Can't allocate servaddr";
-
-	info->pdst = pdst;
-	info->port = servport;
-	info->servaddr->sin_family = AF_INET;
-	info->servaddr->sin_addr.s_addr = inet_addr(pdst);
-	info->servaddr->sin_port = htons(atoi(servport));
+	info->dsturl = dsturl;
+	info->port = dstport;
 
 	return;
 }
@@ -209,6 +196,14 @@ int create_initial_socket()
 	// connect initial socket to server
 	if (connect(sockfd, info->dst, info->dstlen) < 0)
 		throw "Can't connect initial socket to server";
+
+	// record server's addrinfo
+	info->dstaddr = (struct sockaddr_in *)calloc(1, sizeof(struct sockaddr_in));
+	if (info->dstaddr == NULL)
+		throw "Can't allocate dstaddr";
+
+	info->addrlen = sizeof(info->dstaddr);
+	getpeername(sockfd, (struct sockaddr *)(info->dstaddr), &info->addrlen);
 
 	return sockfd;
 }
@@ -466,17 +461,14 @@ int create_socket(int port, char *addr)
 	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
 		throw "Can't set sockopt";
 
-	// creation of the socket
-	struct sockaddr_in servaddr;
-	memset(&servaddr, 0, sizeof(servaddr));
-	servaddr.sin_family = AF_INET;
-	servaddr.sin_addr.s_addr = inet_addr(addr);
-	servaddr.sin_port = htons(port);
+	struct sockaddr_in dataaddr;
+	memset(&dataaddr, 0, sizeof(dataaddr));
+	dataaddr.sin_family = AF_INET;
+	dataaddr.sin_addr.s_addr = inet_addr(addr);
+	dataaddr.sin_port = htons(port);
 
-	if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+	if (connect(sockfd, (struct sockaddr *)&dataaddr, sizeof(dataaddr)) < 0)
 		throw "Can't create data channel";
-	// if (connect(sockfd, info->data, info->datalen) < 0)
-	// 	throw "Can't create data channel";
 
 	return sockfd;
 }
@@ -500,6 +492,8 @@ void user_login(int sockfd)
 		sprintf(sendline, "USER %s\r\n", username.c_str());
 		write(sockfd, sendline, strlen(sendline));
 		result = get_response(sockfd, MAXLINE);
+		if (result.length() == 0)
+			throw "Error: Server didn't respond.";
 		code = result.substr(0, 3);
 	}
 
@@ -514,6 +508,8 @@ void user_login(int sockfd)
 		sprintf(sendline, "PASS %s\r\n", password.c_str());
 		write(sockfd, sendline, strlen(sendline));
 		result = get_response(sockfd, MAXLINE);
+		if (result.length() == 0)
+			throw "Error: Server didn't respond.";
 		code = result.substr(0, 3);
 	}
 
@@ -550,14 +546,14 @@ int get_pasv_socket(int sockfd)
 	int port_p2 = stoi(result.substr(result.rfind(',') + 1, result.rfind(')') - result.rfind(',') - 1));
 	int data_port = port_p1 * 256 + port_p2;
 
-	cout << "Passive data port: " << data_port << endl;
-	if (!isLegalPort(data_port))
-		throw "Invalid data transfer port";
-
 	char data_port_str[10];
 	sprintf(data_port_str, "%d", data_port);
-	tcp_getaddrinfo(info->pdst, data_port_str, true);
-	int data_sock = create_socket(data_port, info->pdst);
+
+	cout << "Passive data port: " << data_port << endl;
+	if (!isLegalPort(data_port_str))
+		throw "Invalid data transfer port";
+
+	int data_sock = create_socket(data_port, inet_ntoa(info->dstaddr->sin_addr));
 
 	return data_sock;
 }
